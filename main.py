@@ -1,44 +1,38 @@
 import os
 import asyncio
 import json
-import platform
-import aiofiles
 from datetime import datetime
 from telegram import Update
-from telegram.error import RetryAfter
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # File to store videos (survives restarts!)
 VIDEO_FILE = "videos.json"
 
-# Concurrency lock to prevent file corruption if multiple uploads happen
-file_lock = asyncio.Lock()
-
-# Load videos from file asynchronously
-async def load_videos():
+# Load videos from file
+def load_videos():
     if os.path.exists(VIDEO_FILE):
         try:
-            async with aiofiles.open(VIDEO_FILE, 'r') as f:
-                content = await f.read()
-                return json.loads(content) if content else []
-        except Exception as e:
-            print(f"Error loading videos: {e}")
+            with open(VIDEO_FILE, 'r') as f:
+                return json.load(f)
+        except:
             return []
     return []
 
-# Save videos to file asynchronously
-async def save_videos(videos):
-    async with file_lock:
-        async with aiofiles.open(VIDEO_FILE, 'w') as f:
-            await f.write(json.dumps(videos, indent=2))
+# Save videos to file
+def save_videos(videos):
+    with open(VIDEO_FILE, 'w') as f:
+        json.dump(videos, f)
+
+# Load videos on startup
+VIDEOS = load_videos()
 
 # REPLACE WITH YOUR TELEGRAM USER ID
 ADMIN_ID = 6234222988
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     is_admin = (user_id == ADMIN_ID)
-    videos = context.bot_data.get("videos", [])
     
     msg = "🎬 *Video Library Bot*\n\n"
     
@@ -46,9 +40,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += "👑 *You are the ADMIN*\n"
         msg += "• Send videos to add them\n"
         msg += "• All videos save permanently\n\n"
-        msg += "*Admin Commands:*\n"
-        msg += "/clear - Delete all videos\n"
-        msg += "/save - Force save to file\n\n"
     else:
         msg += "👋 *Welcome User*\n"
         msg += "• You can only WATCH videos\n"
@@ -62,28 +53,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += "/total - Show statistics\n"
     msg += "/recent - Last 5 videos\n\n"
     
-    msg += f"📊 Videos in library: {len(videos)}\n"
+    if is_admin:
+        msg += "*Admin Commands:*\n"
+        msg += "/clear - Delete all videos\n"
+        msg += "/save - Force save to file\n\n"
+    
+    msg += f"📊 Videos in library: {len(VIDEOS)}\n"
     msg += f"💾 Storage: File-based (permanent)"
     
     await update.message.reply_text(msg, parse_mode='Markdown')
 
+
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Only admin can upload videos"""
+    global VIDEOS
+    
     user_id = update.effective_user.id
-    videos = context.bot_data.get("videos", [])
     
     if user_id != ADMIN_ID:
         await update.message.reply_text("❌ Only admin can upload videos!")
         return
     
     video_file_id = None
-    caption = update.message.caption or f"Video #{len(videos) + 1}"
     
     # Get file_id from video
     if update.message.video:
         video_file_id = update.message.video.file_id
+        caption = update.message.caption or f"Video #{len(VIDEOS) + 1}"
     elif update.message.document and update.message.document.mime_type.startswith('video/'):
         video_file_id = update.message.document.file_id
+        caption = update.message.caption or f"Video #{len(VIDEOS) + 1}"
     else:
         await update.message.reply_text("❌ Please send a video file!")
         return
@@ -96,31 +95,33 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'added_at': datetime.now().isoformat()
     }
     
-    videos.append(video_data)
-    context.bot_data["videos"] = videos
-    await save_videos(videos)  # Save to file immediately
+    VIDEOS.append(video_data)
+    save_videos(VIDEOS)  # Save to file immediately
     
     await update.message.reply_text(
-        f"✅ *Video #{len(videos)} saved!*\n\n"
+        f"✅ *Video #{len(VIDEOS)} saved!*\n\n"
         f"📝 {caption[:100]}\n"
         f"💾 Saved to permanent storage\n\n"
         f"Users can now watch it using /send10",
         parse_mode='Markdown'
     )
 
+
 async def send_videos(update: Update, context: ContextTypes.DEFAULT_TYPE, limit=None):
     """Send videos to users"""
-    # Ensure videos are fresh
-    videos = context.bot_data.get("videos", [])
+    global VIDEOS
     
-    if not videos:
+    # Refresh videos from file (in case of restart)
+    VIDEOS = load_videos()
+    
+    if not VIDEOS:
         await update.message.reply_text("📭 No videos in library yet!")
         return
     
-    count = len(videos) if limit is None else min(limit, len(videos))
+    count = len(VIDEOS) if limit is None else min(limit, len(VIDEOS))
     
     await update.message.reply_text(
-        f"📹 Sending {count} of {len(videos)} videos...\n"
+        f"📹 Sending {count} of {len(VIDEOS)} videos...\n"
         f"⏳ Please wait...",
         parse_mode='Markdown'
     )
@@ -128,8 +129,9 @@ async def send_videos(update: Update, context: ContextTypes.DEFAULT_TYPE, limit=
     sent = 0
     failed = 0
     
-    for idx, video in enumerate(videos[:count], start=1):
+    for idx, video in enumerate(VIDEOS[:count], start=1):
         try:
+            # Send the video
             await context.bot.send_video(
                 chat_id=update.effective_chat.id,
                 video=video['file_id'],
@@ -137,23 +139,8 @@ async def send_videos(update: Update, context: ContextTypes.DEFAULT_TYPE, limit=
                 timeout=30
             )
             sent += 1
-            await asyncio.sleep(0.3)  # Standard rate limiting prevention
+            await asyncio.sleep(0.3)
             
-        except RetryAfter as e:
-            # Respect Telegram's specific rate limit request
-            await asyncio.sleep(e.retry_after + 1)
-            # Try once more
-            try:
-                await context.bot.send_video(
-                    chat_id=update.effective_chat.id,
-                    video=video['file_id'],
-                    caption=f"🎬 Video {idx}/{count}\n📝 {video['caption'][:100]}",
-                    timeout=30
-                )
-                sent += 1
-            except Exception:
-                failed += 1
-                
         except Exception as e:
             print(f"Error sending video {idx}: {e}")
             failed += 1
@@ -162,40 +149,46 @@ async def send_videos(update: Update, context: ContextTypes.DEFAULT_TYPE, limit=
         f"✅ *Complete!*\n\n"
         f"✓ Sent: {sent}\n"
         f"✗ Failed: {failed}\n"
-        f"📊 Total: {len(videos)}",
+        f"📊 Total: {len(VIDEOS)}",
         parse_mode='Markdown'
     )
+
 
 async def send10(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_videos(update, context, limit=10)
 
+
 async def send50(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_videos(update, context, limit=50)
+
 
 async def send100(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_videos(update, context, limit=100)
 
+
 async def sendall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_videos(update, context, limit=None)
 
+
 async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    videos = context.bot_data.get("videos", [])
+    VIDEOS = load_videos()
     await update.message.reply_text(
         f"📊 *Library Stats*\n\n"
-        f"📹 Videos: {len(videos)}\n"
+        f"📹 Videos: {len(VIDEOS)}\n"
         f"💾 Storage: videos.json file\n"
         f"✅ Persists across restarts",
         parse_mode='Markdown'
     )
 
+
 async def recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    videos = context.bot_data.get("videos", [])
-    if not videos:
+    VIDEOS = load_videos()
+    if not VIDEOS:
         await update.message.reply_text("No videos!")
         return
     
-    recent_count = min(5, len(videos))
-    recent_videos = videos[-recent_count:]
+    recent_count = min(5, len(VIDEOS))
+    recent_videos = VIDEOS[-recent_count:]
     
     msg = f"🆕 *Last {recent_count} videos:*\n\n"
     for idx, video in enumerate(reversed(recent_videos), start=1):
@@ -203,16 +196,19 @@ async def recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(msg, parse_mode='Markdown')
 
+
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global VIDEOS
+    
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ Admin only!")
         return
     
-    videos = context.bot_data.get("videos", [])
-    count = len(videos)
-    context.bot_data["videos"] = []
-    await save_videos([])
+    count = len(VIDEOS)
+    VIDEOS = []
+    save_videos(VIDEOS)
     await update.message.reply_text(f"🗑️ Cleared {count} videos!")
+
 
 async def save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: Force save to file"""
@@ -220,41 +216,38 @@ async def save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Admin only!")
         return
     
-    videos = context.bot_data.get("videos", [])
-    await save_videos(videos)
-    await update.message.reply_text(f"💾 Saved {len(videos)} videos to file!")
+    save_videos(VIDEOS)
+    await update.message.reply_text(f"💾 Saved {len(VIDEOS)} videos to file!")
+
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    videos = context.bot_data.get("videos", [])
-    python_version = platform.python_version()
-    
+    VIDEOS = load_videos()
     await update.message.reply_text(
         f"🤖 *Bot Status*\n\n"
-        f"✅ Running on Python {python_version}\n"
-        f"📹 Videos: {len(videos)}\n"
+        f"✅ Running on Python 3.14.3\n"
+        f"📹 Videos: {len(VIDEOS)}\n"
         f"💾 Storage: JSON file (permanent)\n"
         f"🔄 Data survives restarts!\n"
         f"👑 Admin ID: {ADMIN_ID}",
         parse_mode='Markdown'
     )
 
-async def on_startup(app: Application):
-    """Load data when bot starts"""
-    videos = await load_videos()
-    app.bot_data["videos"] = videos
-    print(f"✅ Loaded {len(videos)} videos from file")
 
-def main():
+async def main_async():
     print("=" * 50)
     print("🤖 Starting Video Library Bot (File Storage)")
     print("=" * 50)
     
     TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not TOKEN:
-        print("❌ Token not set! Make sure TELEGRAM_BOT_TOKEN environment variable is defined.")
+        print("❌ Token not set!")
         return
     
-    app = Application.builder().token(TOKEN).post_init(on_startup).build()
+    # Load existing videos
+    videos = load_videos()
+    print(f"✅ Loaded {len(videos)} videos from file")
+    
+    app = Application.builder().token(TOKEN).build()
     
     # Commands
     app.add_handler(CommandHandler("start", start))
@@ -277,8 +270,26 @@ def main():
     print("✅ Bot is running...")
     print("=" * 50)
     
-    # Automatically handles the event loop, signals, and graceful shutdown
-    app.run_polling()
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        print("\n🛑 Stopping...")
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+
+def main():
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        print("\n🛑 Bot stopped")
+
 
 if __name__ == "__main__":
     main()
