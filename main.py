@@ -8,27 +8,27 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 VIDEOS = []
 
 # REPLACE WITH YOUR TELEGRAM USER ID
-ADMIN_ID = 6234222988  # Your ID from the error message
+ADMIN_ID = 6234222988  # Your ID
+
+# Store user states (not needed for basic functionality)
+user_states = {}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎬 *Video Library Bot*\n\n"
         "Send me ANY video and I'll store it!\n\n"
-        "*Supported formats:*\n"
-        "✓ Direct video upload\n"
-        "✓ Forwarded videos\n"
-        "✓ Video as document/file\n"
-        "✓ Compressed videos\n"
-        "✓ HD/4K videos\n\n"
+        "*How to add videos:*\n"
+        "• Upload video directly (📎 → Video)\n"
+        "• Send video as file (📎 → File)\n"
+        "• Forward any video to me\n\n"
         "*Commands:*\n"
-        "/send10 - First 10 videos\n"
-        "/send50 - First 50 videos\n"
-        "/send100 - First 100 videos\n"
-        "/sendall - All videos\n"
-        "/total - Total videos\n"
-        "/recent - Last 5 videos\n"
-        "/status - Bot status\n\n"
+        "/send10 - Get first 10 videos\n"
+        "/send50 - Get first 50 videos\n"
+        "/send100 - Get first 100 videos\n"
+        "/sendall - Get all videos\n"
+        "/total - Show statistics\n"
+        "/recent - Last 5 videos\n\n"
         "*Admin:* /clear - Delete all videos\n\n"
         "⚠️ Videos disappear when bot restarts!",
         parse_mode='Markdown'
@@ -36,48 +36,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Save ANY video to memory - works with all formats"""
+    """Save ANY video to memory"""
     global VIDEOS
     
     video_file_id = None
     video_caption = ""
     video_size = 0
-    video_format = "Unknown"
+    video_type = "Unknown"
     
     # Check for different video types
     if update.message.video:
-        # Regular video upload
         video_file_id = update.message.video.file_id
         video_caption = update.message.caption or "No caption"
         video_size = update.message.video.file_size
-        video_format = "Video (MP4/MOV/AVI)"
+        video_type = "Video"
         
     elif update.message.document:
-        # Video sent as document/file
-        if update.message.document.mime_type and update.message.document.mime_type.startswith('video/'):
+        # Check if document is a video
+        mime_type = update.message.document.mime_type or ""
+        if mime_type.startswith('video/'):
             video_file_id = update.message.document.file_id
             video_caption = update.message.caption or "No caption"
             video_size = update.message.document.file_size
-            video_format = update.message.document.mime_type
+            video_type = "Video (Document)"
         else:
-            await update.message.reply_text("❌ Please send a VIDEO file, not other documents!")
+            await update.message.reply_text("❌ Please send a VIDEO file!")
             return
             
     elif update.message.animation:
-        # GIFs and animations (optional - include if you want GIFs too)
         video_file_id = update.message.animation.file_id
-        video_caption = update.message.caption or "GIF animation"
+        video_caption = update.message.caption or "Animation/GIF"
         video_size = update.message.animation.file_size
-        video_format = "Animation/GIF"
+        video_type = "Animation"
         
     else:
-        await update.message.reply_text(
-            "❌ Please send a video!\n\n"
-            "Ways to send:\n"
-            "• Upload video directly (📎 → Video)\n"
-            "• Upload as document (📎 → File) - must be video format\n"
-            "• Forward any video to me"
-        )
+        await update.message.reply_text("❌ Please send a video file!")
         return
     
     # Save to memory
@@ -87,18 +80,17 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'sender_name': update.effective_user.first_name,
         'sender_id': update.effective_user.id,
         'file_size': video_size,
-        'format': video_format,
+        'type': video_type,
         'timestamp': datetime.now().isoformat()
     })
     
     await update.message.reply_text(
-        f"✅ *Video saved!*\n\n"
+        f"✅ *Video #{len(VIDEOS)} saved!*\n\n"
         f"📹 Total videos: {len(VIDEOS)}\n"
-        f"📝 Caption: {video_caption[:100]}\n"
+        f"📝 Caption: {video_caption[:50]}\n"
         f"👤 By: {update.effective_user.first_name}\n"
-        f"📏 Size: {video_size // 1024} KB\n"
-        f"🎬 Type: {video_format}\n\n"
-        f"Use /send10 to view first 10 videos!",
+        f"📏 Size: {video_size // 1024} KB\n\n"
+        f"Try /send10 to see all videos!",
         parse_mode='Markdown'
     )
 
@@ -108,10 +100,10 @@ async def send_videos(update: Update, context: ContextTypes.DEFAULT_TYPE, limit=
     global VIDEOS
     
     if not VIDEOS:
-        await update.message.reply_text("📭 *No videos in library yet!*\n\nSend me some videos first!", parse_mode='Markdown')
+        await update.message.reply_text("📭 *No videos in library!*\n\nPlease send me some videos first!", parse_mode='Markdown')
         return
     
-    # Determine count to send
+    # Determine how many to send
     if limit is None:
         count = len(VIDEOS)
         title = "All Videos"
@@ -119,43 +111,44 @@ async def send_videos(update: Update, context: ContextTypes.DEFAULT_TYPE, limit=
         count = min(limit, len(VIDEOS))
         title = f"First {count} Videos"
     
-    status_msg = await update.message.reply_text(f"📹 *{title}*\n\nSending {count} of {len(VIDEOS)} total videos...", parse_mode='Markdown')
+    # Send initial message
+    await update.message.reply_text(f"📹 *{title}*\n\nSending {count} of {len(VIDEOS)} total videos...", parse_mode='Markdown')
     
     sent_count = 0
     failed_count = 0
     
     for idx, video in enumerate(VIDEOS[:count], start=1):
         try:
-            # Try to send as video, fallback to document if needed
-            try:
-                await update.message.reply_video(
-                    video['file_id'],
-                    caption=f"🎬 *Video #{idx}*\n📝 {video['caption'][:200]}\n👤 By: {video['sender_name']}",
-                    parse_mode='Markdown',
-                    timeout=30
-                )
-            except:
-                # If video fails, send as document
-                await update.message.reply_document(
-                    video['file_id'],
-                    caption=f"🎬 *Video #{idx}*\n📝 {video['caption'][:200]}\n👤 By: {video['sender_name']}",
-                    parse_mode='Markdown',
-                    timeout=30
-                )
+            # Try to send as video
+            await context.bot.send_video(
+                chat_id=update.effective_chat.id,
+                video=video['file_id'],
+                caption=f"🎬 Video #{idx}\n📝 {video['caption'][:100]}",
+                timeout=30
+            )
             sent_count += 1
-            await asyncio.sleep(0.5)  # Small delay to avoid flooding
+            await asyncio.sleep(0.3)  # Small delay between videos
             
         except Exception as e:
-            failed_count += 1
-            print(f"Failed to send video #{idx}: {e}")
+            # If video fails, try sending as document
+            try:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=video['file_id'],
+                    caption=f"🎬 Video #{idx} (as file)\n📝 {video['caption'][:100]}",
+                    timeout=30
+                )
+                sent_count += 1
+            except:
+                failed_count += 1
+                print(f"Failed to send video #{idx}: {e}")
     
-    await status_msg.delete()
-    
+    # Send summary
     await update.message.reply_text(
-        f"✅ *Finished!*\n\n"
+        f"✅ *Delivery Complete!*\n\n"
         f"✓ Sent: {sent_count} videos\n"
         f"✗ Failed: {failed_count} videos\n"
-        f"📊 Total in library: {len(VIDEOS)}",
+        f"📊 Videos in library: {len(VIDEOS)}",
         parse_mode='Markdown'
     )
 
@@ -177,33 +170,29 @@ async def sendall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show statistics"""
     global VIDEOS
     
     if not VIDEOS:
-        await update.message.reply_text("📊 No videos in library.")
+        await update.message.reply_text("📊 No videos in library yet!")
         return
     
-    total_size = sum(v['file_size'] for v in VIDEOS)
-    unique_senders = len(set(v['sender_id'] for v in VIDEOS))
-    formats = {}
-    for v in VIDEOS:
-        fmt = v.get('format', 'Video')
-        formats[fmt] = formats.get(fmt, 0) + 1
-    
-    format_text = "\n".join([f"   • {k}: {v}" for k, v in list(formats.items())[:5]])
+    total_size = sum(v.get('file_size', 0) for v in VIDEOS)
+    unique_senders = len(set(v.get('sender_id', 0) for v in VIDEOS))
     
     await update.message.reply_text(
         f"📊 *Library Statistics*\n\n"
         f"📹 Total videos: {len(VIDEOS)}\n"
         f"💾 Total size: {total_size // (1024*1024)} MB\n"
-        f"👥 Unique senders: {unique_senders}\n"
-        f"🎬 Video formats:\n{format_text}\n\n"
-        f"🔄 Data resets on restart!",
+        f"👥 Total senders: {unique_senders}\n"
+        f"📝 Latest: {VIDEOS[-1]['caption'][:50] if VIDEOS else 'None'}\n\n"
+        f"Use /send10 to watch videos!",
         parse_mode='Markdown'
     )
 
 
 async def recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show last 5 videos info"""
     if not VIDEOS:
         await update.message.reply_text("No videos yet!")
         return
@@ -213,14 +202,21 @@ async def recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     msg = f"🆕 *Last {recent_count} videos added:*\n\n"
     for idx, video in enumerate(reversed(recent_videos), start=1):
-        msg += f"{idx}. 📝 {video['caption'][:50]}\n"
-        msg += f"   👤 {video['sender_name']} | 📏 {video['file_size'] // 1024}KB\n"
-        msg += f"   🎬 {video.get('format', 'Video')}\n\n"
+        size_mb = video.get('file_size', 0) // (1024*1024)
+        msg += f"{idx}. 📝 {video['caption'][:40]}\n"
+        msg += f"   👤 {video['sender_name']} | 📏 {size_mb} MB\n\n"
     
     await update.message.reply_text(msg, parse_mode='Markdown')
+    
+    # Offer to send them
+    await update.message.reply_text(
+        f"Type /send{recent_count} to watch these videos!",
+        parse_mode='Markdown'
+    )
 
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin only: Clear all videos"""
     global VIDEOS
     
     if update.effective_user.id != ADMIN_ID:
@@ -237,56 +233,39 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show bot status"""
     await update.message.reply_text(
         f"🤖 *Bot Status*\n\n"
-        f"✅ Running on Python 3.14.3\n"
-        f"📹 Videos in memory: {len(VIDEOS)}\n"
+        f"✅ Bot is running\n"
+        f"🐍 Python 3.14.3\n"
+        f"📹 Videos in library: {len(VIDEOS)}\n"
         f"🎬 Supports: All video formats\n"
-        f"📤 Upload: Direct, Forward, Document\n"
-        f"🔄 Data resets on restart\n"
-        f"🌐 Host: Render.com",
+        f"💾 Storage: RAM (resets on restart)\n\n"
+        f"Commands ready: /send10, /send50, /send100, /sendall",
         parse_mode='Markdown'
     )
 
 
-async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin only: Export video list to file"""
-    global VIDEOS
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages that aren't commands"""
+    text = update.message.text.lower()
     
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ Access Denied!")
-        return
-    
-    if not VIDEOS:
-        await update.message.reply_text("No videos to backup!")
-        return
-    
-    backup_text = f"Video Library Backup\nGenerated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nTotal Videos: {len(VIDEOS)}\n{'='*50}\n\n"
-    
-    for idx, video in enumerate(VIDEOS, start=1):
-        backup_text += f"Video #{idx}\n"
-        backup_text += f"File ID: {video['file_id']}\n"
-        backup_text += f"Caption: {video['caption']}\n"
-        backup_text += f"Sender: {video['sender_name']}\n"
-        backup_text += f"Size: {video['file_size']} bytes\n"
-        backup_text += f"Format: {video.get('format', 'Video')}\n"
-        backup_text += f"{'-'*30}\n"
-    
-    filename = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(backup_text)
-    
-    with open(filename, "rb") as f:
-        await update.message.reply_document(document=f, filename=filename)
-    
-    os.remove(filename)
-    await update.message.reply_text("💾 Backup created successfully!")
+    # If user just types a number, send that many videos
+    if text.isdigit():
+        num = int(text)
+        if 1 <= num <= 100:
+            await send_videos(update, context, limit=num)
+        else:
+            await update.message.reply_text("Please enter a number between 1 and 100")
+    else:
+        # Ignore other text
+        pass
 
 
 async def main_async():
     """Async main function for Python 3.14"""
     print("🤖 Starting Video Library Bot...")
-    print(f"🐍 Python version: 3.14.3 compatible")
+    print(f"🐍 Python version: 3.14.3")
     print("=" * 50)
     
     TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -294,9 +273,10 @@ async def main_async():
         print("❌ ERROR: TELEGRAM_BOT_TOKEN environment variable not set!")
         return
     
-    print(f"✅ Bot token found")
-    print(f"👤 Admin ID set to: {ADMIN_ID}")
+    print(f"✅ Bot token loaded")
+    print(f"👤 Admin ID: {ADMIN_ID}")
     
+    # Create application
     app = Application.builder().token(TOKEN).build()
     
     # Add command handlers
@@ -309,24 +289,27 @@ async def main_async():
     app.add_handler(CommandHandler("recent", recent))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("backup", backup))
     
-    # Handle ALL video types
+    # Handle videos (any format)
     app.add_handler(MessageHandler(
         filters.VIDEO | filters.Document.VIDEO | filters.ANIMATION, 
         handle_video
     ))
     
-    print(f"✅ Commands registered")
-    print(f"✅ Supporting: Direct videos, Documents, Animations")
-    print("🤖 Bot is polling for updates...")
+    # Handle text messages
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    print(f"✅ Commands registered:")
+    print(f"   • /send10, /send50, /send100, /sendall")
+    print(f"   • /total, /recent, /status")
+    print(f"   • /clear (admin only)")
+    print(f"✅ Video detection: ON (all formats)")
+    print("🤖 Bot is polling...")
     print("=" * 50)
     
-    # For Python 3.14, initialize and start properly
+    # Initialize and start
     await app.initialize()
     await app.start()
-    
-    # Start polling
     await app.updater.start_polling()
     
     # Keep running
@@ -341,11 +324,11 @@ async def main_async():
 
 
 def main():
-    """Entry point for Python 3.14"""
+    """Entry point"""
     try:
         asyncio.run(main_async())
     except KeyboardInterrupt:
-        print("\n🛑 Bot stopped manually")
+        print("\n🛑 Bot stopped")
 
 
 if __name__ == "__main__":
