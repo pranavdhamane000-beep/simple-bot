@@ -361,6 +361,11 @@ def build_app() -> Application:
 
 
 def main() -> None:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     init_db()
     print("Starting Video Sharing Bot")
     print(f"Database file: {DB_FILE}")
