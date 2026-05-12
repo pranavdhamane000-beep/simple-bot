@@ -200,7 +200,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/sendall - Send all videos\n"
         "/total - Show total videos\n"
         "/recent - Show last 5 saved videos\n"
-        "/status - Bot status\n\n"
+        
         
     )
 
