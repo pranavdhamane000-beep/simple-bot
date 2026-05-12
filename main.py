@@ -1,7 +1,9 @@
 import asyncio
 import os
 import sqlite3
+import threading
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +15,33 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "6234222988"))
 DB_FILE = Path(os.environ.get("DB_FILE", "videos.db"))
+PORT = int(os.environ.get("PORT", "10000"))
 
 db_lock = asyncio.Lock()
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path not in {"/", "/health"}:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"Not found")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Video bot is running")
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+
+def start_health_server() -> None:
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"Health server listening on port {PORT}")
 
 
 def utc_now() -> str:
@@ -370,6 +397,7 @@ def main() -> None:
     print("Starting Video Sharing Bot")
     print(f"Database file: {DB_FILE}")
     print(f"Loaded videos: {count_videos()}")
+    start_health_server()
 
     app = build_app()
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
