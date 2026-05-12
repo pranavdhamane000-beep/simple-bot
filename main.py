@@ -13,7 +13,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "6234222988"))
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "2115520354"))
 DB_FILE = Path(os.environ.get("DB_FILE", "videos.db"))
 PORT = int(os.environ.get("PORT", "10000"))
 
