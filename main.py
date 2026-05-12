@@ -193,10 +193,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     role = "Admin" if is_admin(update) else "User"
 
     text = (
-        "Video Sharing Bot\n\n"
-        f"Role: {role}\n"
-        f"Videos saved: {total}\n\n"
-        "Commands:\n"
+        
         "/send10 - Send first 10 videos\n"
         "/send50 - Send first 50 videos\n"
         "/send100 - Send first 100 videos\n"
@@ -204,9 +201,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/total - Show total videos\n"
         "/recent - Show last 5 saved videos\n"
         "/status - Bot status\n\n"
-        "Admin:\n"
-        "Send any Telegram video or any video file as a document.\n"
-        "All video formats are supported because document uploads are stored and resent as documents."
+        
     )
 
     await update.effective_message.reply_text(text)
