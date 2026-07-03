@@ -547,6 +547,9 @@ async def async_main() -> None:
     # Add error handler
     application.add_error_handler(error_handler)
 
+    # Initialize the application first
+    await application.initialize()
+    
     # Start the health check server in the background
     health_task = asyncio.create_task(start_health_server())
 
@@ -556,13 +559,18 @@ async def async_main() -> None:
     print(f"🗑️ Messages will auto-delete after {MESSAGE_EXPIRY} seconds")
     
     try:
-        await application.run_polling(allowed_updates=Update.ALL_TYPES)
+        await application.start()
+        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        # Keep the bot running
+        await asyncio.Event().wait()
     finally:
         health_task.cancel()
         try:
             await health_task
         except asyncio.CancelledError:
             pass
+        await application.stop()
+        await application.shutdown()
 
 def main() -> None:
     """Entry point for the bot"""
