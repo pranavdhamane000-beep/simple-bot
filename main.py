@@ -1,402 +1,539 @@
-import asyncio
 import os
-import sqlite3
-import threading
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from typing import Any
+import logging
+import json
+import asyncio
+from datetime import datetime
+from typing import Dict, Optional
+import redis
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-from telegram import Update
-from telegram.error import TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+# Load environment variables
+load_dotenv()
 
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "2115520354"))
-DB_FILE = Path(os.environ.get("DB_FILE", "videos.db"))
-PORT = int(os.environ.get("PORT", "10000"))
+# Initialize Redis for session management
+REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
+redis_client = redis.from_url(REDIS_URL)
 
-db_lock = asyncio.Lock()
+# Bot token
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is required")
 
+# Constants
+CHAT_SESSION_PREFIX = "chat_session:"
+USER_SESSION_PREFIX = "user_session:"
+CHAT_LINK_PREFIX = "chat_link:"
+MESSAGE_PREFIX = "message:"
+CHAT_EXPIRY = 3600  # 1 hour
+MESSAGE_EXPIRY = 60  # 1 minute in seconds
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
-        if self.path not in {"/", "/health"}:
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b"Not found")
-            return
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"Video bot is running")
-
-    def log_message(self, format: str, *args: Any) -> None:
-        return
-
-
-def start_health_server() -> None:
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    print(f"Health server listening on port {PORT}")
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def is_admin(update: Update) -> bool:
-    return bool(update.effective_user and update.effective_user.id == ADMIN_ID)
-
-
-def connect_db() -> sqlite3.Connection:
-    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(DB_FILE)
-    connection.row_factory = sqlite3.Row
-    return connection
-
-
-def init_db() -> None:
-    with connect_db() as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS videos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_id TEXT NOT NULL,
-                media_type TEXT NOT NULL,
-                file_name TEXT,
-                mime_type TEXT,
-                caption TEXT,
-                added_by_id INTEGER,
-                added_by_name TEXT,
-                added_at TEXT NOT NULL
-            )
-            """
+class ChatManager:
+    @staticmethod
+    def create_chat_session(user_id: int) -> str:
+        """Create a new chat session and return the link ID"""
+        link_id = f"link_{user_id}_{int(datetime.now().timestamp())}"
+        
+        # Store chat session
+        session_data = {
+            'user1': user_id,
+            'user2': None,
+            'created_at': datetime.now().isoformat(),
+            'active': True
+        }
+        
+        redis_client.setex(
+            f"{CHAT_SESSION_PREFIX}{link_id}",
+            CHAT_EXPIRY,
+            json.dumps(session_data)
         )
-        connection.commit()
-
-
-def row_to_video(row: sqlite3.Row) -> dict[str, Any]:
-    return {
-        "id": row["id"],
-        "file_id": row["file_id"],
-        "media_type": row["media_type"],
-        "file_name": row["file_name"],
-        "mime_type": row["mime_type"],
-        "caption": row["caption"],
-        "added_by_id": row["added_by_id"],
-        "added_by_name": row["added_by_name"],
-        "added_at": row["added_at"],
-    }
-
-
-def count_videos() -> int:
-    with connect_db() as connection:
-        row = connection.execute("SELECT COUNT(*) AS total FROM videos").fetchone()
-        return int(row["total"])
-
-
-def load_videos(limit: int | None = None) -> list[dict[str, Any]]:
-    query = "SELECT * FROM videos ORDER BY id ASC"
-    params: tuple[Any, ...] = ()
-
-    if limit is not None:
-        query += " LIMIT ?"
-        params = (limit,)
-
-    with connect_db() as connection:
-        rows = connection.execute(query, params).fetchall()
-        return [row_to_video(row) for row in rows]
-
-
-def load_recent_videos(limit: int = 5) -> list[dict[str, Any]]:
-    with connect_db() as connection:
-        rows = connection.execute(
-            "SELECT * FROM videos ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [row_to_video(row) for row in rows]
-
-
-def insert_video(video: dict[str, Any]) -> int:
-    with connect_db() as connection:
-        cursor = connection.execute(
-            """
-            INSERT INTO videos (
-                file_id,
-                media_type,
-                file_name,
-                mime_type,
-                caption,
-                added_by_id,
-                added_by_name,
-                added_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                video["file_id"],
-                video["media_type"],
-                video.get("file_name"),
-                video.get("mime_type"),
-                video.get("caption"),
-                video.get("added_by_id"),
-                video.get("added_by_name"),
-                video["added_at"],
-            ),
+        
+        # Store link to user mapping
+        redis_client.setex(
+            f"{CHAT_LINK_PREFIX}{link_id}",
+            CHAT_EXPIRY,
+            str(user_id)
         )
-        connection.commit()
-        return int(cursor.lastrowid)
-
-
-def clear_videos() -> int:
-    with connect_db() as connection:
-        count = count_videos()
-        connection.execute("DELETE FROM videos")
-        connection.commit()
-        return count
-
-
-def get_upload_data(update: Update, current_count: int) -> dict[str, Any] | None:
-    message = update.effective_message
-    if not message:
+        
+        # Store user's active chat
+        redis_client.setex(
+            f"{USER_SESSION_PREFIX}{user_id}",
+            CHAT_EXPIRY,
+            link_id
+        )
+        
+        return link_id
+    
+    @staticmethod
+    def join_chat(link_id: str, user_id: int) -> Optional[Dict]:
+        """Join an existing chat session"""
+        session_key = f"{CHAT_SESSION_PREFIX}{link_id}"
+        session_data = redis_client.get(session_key)
+        
+        if not session_data:
+            return None
+        
+        session = json.loads(session_data)
+        
+        # Check if chat is still active and not full
+        if not session['active'] or session['user2'] is not None:
+            return None
+        
+        # Check if user is trying to join their own chat
+        if session['user1'] == user_id:
+            return None
+        
+        # Add second user
+        session['user2'] = user_id
+        redis_client.setex(session_key, CHAT_EXPIRY, json.dumps(session))
+        
+        # Store user's active chat
+        redis_client.setex(
+            f"{USER_SESSION_PREFIX}{user_id}",
+            CHAT_EXPIRY,
+            link_id
+        )
+        
+        return session
+    
+    @staticmethod
+    def get_chat_session(link_id: str) -> Optional[Dict]:
+        """Get chat session data"""
+        session_data = redis_client.get(f"{CHAT_SESSION_PREFIX}{link_id}")
+        if session_data:
+            return json.loads(session_data)
+        return None
+    
+    @staticmethod
+    def get_user_chat(user_id: int) -> Optional[str]:
+        """Get active chat link for a user"""
+        link_id = redis_client.get(f"{USER_SESSION_PREFIX}{user_id}")
+        if link_id:
+            return link_id.decode('utf-8')
+        return None
+    
+    @staticmethod
+    def end_chat(link_id: str, user_id: int = None):
+        """End a chat session"""
+        session_key = f"{CHAT_SESSION_PREFIX}{link_id}"
+        session_data = redis_client.get(session_key)
+        
+        if session_data:
+            session = json.loads(session_data)
+            session['active'] = False
+            redis_client.setex(session_key, 300, json.dumps(session))  # Keep for 5 mins
+            
+            # Remove user sessions
+            if session['user1']:
+                redis_client.delete(f"{USER_SESSION_PREFIX}{session['user1']}")
+            if session['user2']:
+                redis_client.delete(f"{USER_SESSION_PREFIX}{session['user2']}")
+            
+            # Remove link
+            redis_client.delete(f"{CHAT_LINK_PREFIX}{link_id}")
+            
+            # Clean up any pending messages
+            pattern = f"{MESSAGE_PREFIX}{link_id}:*"
+            for key in redis_client.scan_iter(match=pattern):
+                redis_client.delete(key)
+    
+    @staticmethod
+    def store_message(link_id: str, message_id: int, sender_id: int, receiver_id: int):
+        """Store message metadata for auto-deletion"""
+        message_key = f"{MESSAGE_PREFIX}{link_id}:{message_id}"
+        message_data = {
+            'message_id': message_id,
+            'sender_id': sender_id,
+            'receiver_id': receiver_id,
+            'sent_at': datetime.now().isoformat(),
+            'delivered': False
+        }
+        redis_client.setex(message_key, MESSAGE_EXPIRY + 10, json.dumps(message_data))
+        return message_key
+    
+    @staticmethod
+    def mark_message_delivered(link_id: str, message_id: int):
+        """Mark message as delivered (seen by receiver)"""
+        message_key = f"{MESSAGE_PREFIX}{link_id}:{message_id}"
+        message_data = redis_client.get(message_key)
+        if message_data:
+            data = json.loads(message_data)
+            data['delivered'] = True
+            data['delivered_at'] = datetime.now().isoformat()
+            redis_client.setex(message_key, MESSAGE_EXPIRY + 5, json.dumps(data))
+            return True
+        return False
+    
+    @staticmethod
+    def get_message(link_id: str, message_id: int) -> Optional[Dict]:
+        """Get message data"""
+        message_key = f"{MESSAGE_PREFIX}{link_id}:{message_id}"
+        message_data = redis_client.get(message_key)
+        if message_data:
+            return json.loads(message_data)
         return None
 
-    caption = message.caption or f"Video #{current_count + 1}"
-
-    if message.video:
-        return {
-            "file_id": message.video.file_id,
-            "media_type": "video",
-            "file_name": message.video.file_name,
-            "mime_type": message.video.mime_type,
-            "caption": caption,
-        }
-
-    if message.document:
-        return {
-            "file_id": message.document.file_id,
-            "media_type": "document",
-            "file_name": message.document.file_name,
-            "mime_type": message.document.mime_type,
-            "caption": caption,
-        }
-
-    return None
-
-
+# Bot command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    total = count_videos()
-    role = "Admin" if is_admin(update) else "User"
-
-    text = (
-        
-        "/send10 - Send first 10 videos\n"
-        "/send50 - Send first 50 videos\n"
-        "/send100 - Send first 100 videos\n"
-        "/sendall - Send all videos\n"
-        "/total - Show total videos\n"
-        "/recent - Show last 5 saved videos\n"
-        
-        
-    )
-
-    await update.effective_message.reply_text(text)
-
-
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        await update.effective_message.reply_text("Only admin can upload videos.")
+    """Handle /start command"""
+    user_id = update.effective_user.id
+    
+    # Check if this is a deep link (joining a chat)
+    if context.args and context.args[0].startswith('link_'):
+        await join_chat(update, context)
         return
+    
+    welcome_text = """
+👋 Welcome to Anonymous Chat Bot!
 
-    async with db_lock:
-        total = count_videos()
-        video_data = get_upload_data(update, total)
+🔒 Your identity is completely hidden
+👤 No one can see your name or username
+💬 Chat anonymously with others
+🗑️ Messages auto-delete 1 minute after being seen
 
-        if not video_data:
-            await update.effective_message.reply_text("Please send a Telegram video or a video file as a document.")
-            return
+Commands:
+/chat - Start a new anonymous chat
+/end - End current chat
+/help - Show this help message
 
-        video_data.update(
-            {
-                "added_by_id": update.effective_user.id,
-                "added_by_name": update.effective_user.first_name,
-                "added_at": utc_now(),
-            }
-        )
-        saved_id = insert_video(video_data)
+To start chatting, use /chat and share the generated link with someone!
+    """
+    await update.message.reply_text(welcome_text)
 
-    file_name = video_data.get("file_name") or video_data.get("caption") or "video file"
-    await update.effective_message.reply_text(
-        f"Saved video #{saved_id}\n\n"
-        f"Name: {file_name}\n"
-        f"Type: {video_data.get('media_type')}\n"
-        "Users can now watch it with /send10, /send100 or /sendall."
-    )
-
-
-async def send_saved_video(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    video: dict[str, Any],
-    caption: str,
-) -> None:
-    file_id = video["file_id"]
-
-    if video.get("media_type") == "document":
-        await context.bot.send_document(chat_id=chat_id, document=file_id, caption=caption)
-        return
-
-    try:
-        await context.bot.send_video(chat_id=chat_id, video=file_id, caption=caption)
-    except TelegramError as video_error:
-        try:
-            await context.bot.send_document(chat_id=chat_id, document=file_id, caption=caption)
-        except TelegramError as document_error:
-            raise RuntimeError(
-                f"send_video failed: {video_error}; send_document failed: {document_error}"
-            ) from document_error
-
-
-async def send_videos(update: Update, context: ContextTypes.DEFAULT_TYPE, limit: int | None) -> None:
-    total = count_videos()
-    if total == 0:
-        await update.effective_message.reply_text("No videos saved yet.")
-        return
-
-    count = total if limit is None else min(limit, total)
-    videos = load_videos(count)
-
-    await update.effective_message.reply_text(f"Sending {count} of {total} videos. Please wait...")
-
-    sent = 0
-    failed = 0
-    first_error = None
-
-    for index, video in enumerate(videos, start=1):
-        try:
-            caption = video.get("caption") or video.get("file_name") or f"Video {index}"
-            await send_saved_video(
-                context=context,
-                chat_id=update.effective_chat.id,
-                video=video,
-                caption=f"Video {index}/{count}\n{caption[:900]}",
+async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /chat command - create a new chat link"""
+    user_id = update.effective_user.id
+    
+    # Check if user is already in a chat
+    existing_chat = ChatManager.get_user_chat(user_id)
+    if existing_chat:
+        session = ChatManager.get_chat_session(existing_chat)
+        if session and session['active']:
+            await update.message.reply_text(
+                "⚠️ You're already in a chat! Use /end to end the current chat first."
             )
-            sent += 1
-            await asyncio.sleep(0.5)
-        except Exception as error:
-            failed += 1
-            first_error = first_error or str(error)
-            print(f"Error sending video {index}: {error}")
-
-    result = f"Complete\n\nSent: {sent}\nFailed: {failed}\nTotal saved: {total}"
-    if first_error:
-        result += f"\n\nFirst error:\n{first_error[:500]}"
-
-    await update.effective_message.reply_text(result)
-
-
-async def send10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_videos(update, context, 10)
-
-
-async def send50(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_videos(update, context, 50)
-
-
-async def send100(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_videos(update, context, 100)
-
-
-async def sendall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_videos(update, context, None)
-
-
-async def total(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(f"Total videos saved: {count_videos()}")
-
-
-async def recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    videos = load_recent_videos(5)
-    if not videos:
-        await update.effective_message.reply_text("No videos saved yet.")
-        return
-
-    lines = [f"Last {len(videos)} videos:"]
-
-    for index, video in enumerate(videos, start=1):
-        name = video.get("caption") or video.get("file_name") or "Untitled video"
-        media_type = video.get("media_type", "unknown")
-        lines.append(f"{index}. [{media_type}] {name[:80]}")
-
-    await update.effective_message.reply_text("\n".join(lines))
-
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
-        "Bot status\n\n"
-        "Running: yes\n"
-        f"Database file: {DB_FILE}\n"
-        f"Videos saved: {count_videos()}\n"
-        f"Admin ID: {ADMIN_ID}"
+            return
+        else:
+            # Clean up stale session
+            ChatManager.end_chat(existing_chat)
+    
+    # Create new chat session
+    link_id = ChatManager.create_chat_session(user_id)
+    
+    # Generate bot link
+    bot_username = context.bot.username
+    chat_link = f"https://t.me/{bot_username}?start={link_id}"
+    
+    # Create inline keyboard
+    keyboard = [
+        [InlineKeyboardButton("📋 Copy Link", callback_data=f"copy_{link_id}")],
+        [InlineKeyboardButton("🔗 Share Link", switch_inline_query=chat_link)]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"🔐 Your anonymous chat link is ready!\n\n"
+        f"Share this link with ONE person to start chatting:\n"
+        f"`{chat_link}`\n\n"
+        f"⚠️ Link expires in 1 hour\n"
+        f"⚠️ Only the first person who clicks will join\n"
+        f"⚠️ You can't join your own chat\n"
+        f"🗑️ Messages auto-delete 1 minute after being seen",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
     )
 
-
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        await update.effective_message.reply_text("Admin only.")
+async def join_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle joining a chat via link"""
+    user_id = update.effective_user.id
+    
+    # Get link ID from the start parameter
+    if not context.args:
+        await update.message.reply_text("❌ Invalid chat link!")
         return
+    
+    link_id = context.args[0]
+    
+    # Check if user is already in a chat
+    existing_chat = ChatManager.get_user_chat(user_id)
+    if existing_chat:
+        session = ChatManager.get_chat_session(existing_chat)
+        if session and session['active']:
+            await update.message.reply_text(
+                "⚠️ You're already in a chat! Use /end to end the current chat first."
+            )
+            return
+    
+    # Join the chat
+    session = ChatManager.join_chat(link_id, user_id)
+    
+    if not session:
+        await update.message.reply_text(
+            "❌ This chat link is invalid or already in use!\n\n"
+            "Possible reasons:\n"
+            "• Link has expired (1 hour limit)\n"
+            "• Someone already joined this chat\n"
+            "• You're trying to join your own chat"
+        )
+        return
+    
+    # Notify both users
+    user1_id = session['user1']
+    user2_id = session['user2']
+    
+    try:
+        await context.bot.send_message(
+            user1_id,
+            "✅ Someone has joined your chat! Start messaging anonymously.\n\n"
+            "💬 Send messages to chat anonymously\n"
+            "🗑️ Messages auto-delete 1 minute after being seen\n"
+            "🚫 Use /end to end the chat"
+        )
+    except Exception as e:
+        logger.error(f"Error notifying user1: {e}")
+    
+    await update.message.reply_text(
+        "✅ You've joined the anonymous chat!\n\n"
+        "💬 Send messages to chat anonymously\n"
+        "📤 Your identity is completely hidden\n"
+        "🗑️ Messages auto-delete 1 minute after being seen\n"
+        "🚫 Use /end to end the chat"
+    )
 
-    async with db_lock:
-        count = clear_videos()
+async def end_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /end command - end current chat"""
+    user_id = update.effective_user.id
+    
+    # Find user's chat
+    link_id = ChatManager.get_user_chat(user_id)
+    
+    if not link_id:
+        await update.message.reply_text("❌ You're not in any active chat!")
+        return
+    
+    # Get chat session
+    session = ChatManager.get_chat_session(link_id)
+    
+    if session and session['active']:
+        # Get other user ID
+        other_user_id = session['user1'] if session['user1'] != user_id else session['user2']
+        
+        # End the chat
+        ChatManager.end_chat(link_id, user_id)
+        
+        # Notify other user
+        if other_user_id:
+            try:
+                await context.bot.send_message(
+                    other_user_id,
+                    "🔚 The other user has ended the chat."
+                )
+            except Exception as e:
+                logger.error(f"Error notifying other user: {e}")
+        
+        await update.message.reply_text("🔚 Chat ended successfully!")
+    else:
+        await update.message.reply_text("❌ Chat not found or already ended!")
 
-    await update.effective_message.reply_text(f"Cleared {count} videos from SQLite.")
+async def delete_message_after_delay(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int = 60):
+    """Delete a message after specified delay"""
+    await asyncio.sleep(delay)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        logger.info(f"Deleted message {message_id} in chat {chat_id} after {delay} seconds")
+    except Exception as e:
+        logger.error(f"Failed to delete message {message_id}: {e}")
 
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle regular messages (anonymous chatting)"""
+    user_id = update.effective_user.id
+    message_text = update.message.text
+    message_id = update.message.message_id
+    
+    if not message_text:
+        return
+    
+    # Find user's active chat
+    link_id = ChatManager.get_user_chat(user_id)
+    
+    if not link_id:
+        await update.message.reply_text(
+            "❌ You're not in an active chat!\n"
+            "Use /chat to start a new anonymous chat."
+        )
+        return
+    
+    # Get chat session
+    session = ChatManager.get_chat_session(link_id)
+    
+    if not session or not session['active']:
+        await update.message.reply_text("❌ This chat is no longer active!")
+        # Clean up
+        ChatManager.end_chat(link_id)
+        return
+    
+    # Determine other user
+    other_user_id = session['user1'] if session['user1'] != user_id else session['user2']
+    
+    if not other_user_id:
+        await update.message.reply_text("❌ No other user in the chat!")
+        return
+    
+    # Store message in Redis for tracking
+    ChatManager.store_message(link_id, message_id, user_id, other_user_id)
+    
+    # Send message to other user
+    try:
+        # Send the message to the other user
+        sent_message = await context.bot.send_message(
+            other_user_id,
+            f"💬 {message_text}"
+        )
+        
+        # Store the forwarded message ID for deletion
+        ChatManager.store_message(link_id, sent_message.message_id, user_id, other_user_id)
+        
+        # Schedule deletion of the sender's original message
+        asyncio.create_task(
+            delete_message_after_delay(
+                context, 
+                update.effective_chat.id, 
+                message_id, 
+                MESSAGE_EXPIRY
+            )
+        )
+        
+        # Schedule deletion of the sent message (to other user)
+        asyncio.create_task(
+            delete_message_after_delay(
+                context, 
+                other_user_id, 
+                sent_message.message_id, 
+                MESSAGE_EXPIRY
+            )
+        )
+        
+        # Send confirmation to sender (this will also be deleted)
+        confirm_msg = await update.message.reply_text(
+            f"✅ Message sent anonymously (will auto-delete in {MESSAGE_EXPIRY}s)"
+        )
+        
+        # Delete confirmation message after 5 seconds (not 1 minute)
+        asyncio.create_task(
+            delete_message_after_delay(
+                context, 
+                update.effective_chat.id, 
+                confirm_msg.message_id, 
+                5
+            )
+        )
+        
+    except Exception as e:
+        logger.error(f"Error sending message: {e}")
+        error_msg = await update.message.reply_text("❌ Failed to send message. The other user might have left.")
+        # Delete error message after 5 seconds
+        asyncio.create_task(
+            delete_message_after_delay(
+                context, 
+                update.effective_chat.id, 
+                error_msg.message_id, 
+                5
+            )
+        )
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    print(f"Update caused error: {context.error}")
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle button callbacks"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data.startswith("copy_"):
+        link_id = query.data.replace("copy_", "")
+        chat_link = f"https://t.me/{context.bot.username}?start={link_id}"
+        await query.message.reply_text(
+            f"📋 Share this link with someone:\n\n"
+            f"`{chat_link}`\n\n"
+            f"⚠️ Only the first person who clicks will join\n"
+            f"🗑️ Messages auto-delete 1 minute after being seen",
+            parse_mode='Markdown'
+        )
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /help command"""
+    help_text = """
+🤖 Anonymous Chat Bot Help
 
-def build_app() -> Application:
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is missing.")
+Commands:
+/chat - Create a new anonymous chat link
+/end - End your current chat
+/help - Show this help message
 
-    app = Application.builder().token(BOT_TOKEN).build()
+How it works:
+1. Use /chat to generate a unique link
+2. Share the link with someone (only ONE person)
+3. When they join, you can chat anonymously
+4. Your name and username are never shown
+5. Messages auto-delete 1 minute after being seen
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("send10", send10))
-    app.add_handler(CommandHandler("send50", send50))
-    app.add_handler(CommandHandler("send100", send100))
-    app.add_handler(CommandHandler("sendall", sendall))
-    app.add_handler(CommandHandler("total", total))
-    app.add_handler(CommandHandler("recent", recent))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("clear", clear))
+Privacy Features:
+🔒 Complete anonymity
+👤 No personal information shared
+🗑️ No chat history stored
+⏰ Messages auto-delete after 60 seconds
+🔐 End-to-end private chatting
 
-    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, handle_video))
-    app.add_error_handler(error_handler)
+Auto-Delete Details:
+• Messages are deleted 60 seconds after being sent
+• Both sender and receiver see messages disappear
+• Confirmation messages delete after 5 seconds
+• No message history is stored
 
-    return app
+⚠️ Important Notes:
+• Link expires in 1 hour
+• Only the first person who clicks can join
+• You can't join your own chat
+• Both users must stay in the chat
+    """
+    await update.message.reply_text(help_text)
 
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors"""
+    logger.error(f"Update {update} caused error {context.error}")
 
 def main() -> None:
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
+    """Start the bot"""
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
 
-    init_db()
-    print("Starting Video Sharing Bot")
-    print(f"Database file: {DB_FILE}")
-    print(f"Loaded videos: {count_videos()}")
-    start_health_server()
+    # Add command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("chat", chat_command))
+    application.add_handler(CommandHandler("end", end_chat))
+    application.add_handler(CommandHandler("help", help_command))
+    
+    # Add callback handler for buttons
+    application.add_handler(CallbackQueryHandler(button_callback))
+    
+    # Add message handler for chat messages
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    )
+    
+    # Add error handler
+    application.add_error_handler(error_handler)
 
-    app = build_app()
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+    # Start the Bot
+    print("🤖 Bot is starting...")
+    print(f"Bot username: @{application.bot.username}")
+    print(f"🗑️ Messages will auto-delete after {MESSAGE_EXPIRY} seconds")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
