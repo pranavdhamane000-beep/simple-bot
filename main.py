@@ -4,7 +4,6 @@ import json
 import asyncio
 from datetime import datetime
 from typing import Dict, Optional
-import redis
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -20,21 +19,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize Redis for session management
-REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
-redis_client = redis.from_url(REDIS_URL)
-
 # Bot token
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required")
 
+# In-memory storage (replaces Redis)
+chat_sessions: Dict[str, Dict] = {}  # Store active chat sessions
+user_sessions: Dict[int, str] = {}   # Map user_id to session_id
+chat_links: Dict[str, int] = {}      # Map link_id to user_id
+messages: Dict[str, Dict] = {}       # Store messages for auto-deletion
+
 # Constants
-CHAT_SESSION_PREFIX = "chat_session:"
-USER_SESSION_PREFIX = "user_session:"
-CHAT_LINK_PREFIX = "chat_link:"
-MESSAGE_PREFIX = "message:"
-CHAT_EXPIRY = 3600  # 1 hour
+CHAT_EXPIRY = 3600  # 1 hour (not enforced strictly without Redis)
 MESSAGE_EXPIRY = 60  # 1 minute in seconds
 
 class ChatManager:
@@ -51,38 +48,19 @@ class ChatManager:
             'active': True
         }
         
-        redis_client.setex(
-            f"{CHAT_SESSION_PREFIX}{link_id}",
-            CHAT_EXPIRY,
-            json.dumps(session_data)
-        )
-        
-        # Store link to user mapping
-        redis_client.setex(
-            f"{CHAT_LINK_PREFIX}{link_id}",
-            CHAT_EXPIRY,
-            str(user_id)
-        )
-        
-        # Store user's active chat
-        redis_client.setex(
-            f"{USER_SESSION_PREFIX}{user_id}",
-            CHAT_EXPIRY,
-            link_id
-        )
+        chat_sessions[link_id] = session_data
+        chat_links[link_id] = user_id
+        user_sessions[user_id] = link_id
         
         return link_id
     
     @staticmethod
     def join_chat(link_id: str, user_id: int) -> Optional[Dict]:
         """Join an existing chat session"""
-        session_key = f"{CHAT_SESSION_PREFIX}{link_id}"
-        session_data = redis_client.get(session_key)
+        session = chat_sessions.get(link_id)
         
-        if not session_data:
+        if not session:
             return None
-        
-        session = json.loads(session_data)
         
         # Check if chat is still active and not full
         if not session['active'] or session['user2'] is not None:
@@ -94,62 +72,51 @@ class ChatManager:
         
         # Add second user
         session['user2'] = user_id
-        redis_client.setex(session_key, CHAT_EXPIRY, json.dumps(session))
-        
-        # Store user's active chat
-        redis_client.setex(
-            f"{USER_SESSION_PREFIX}{user_id}",
-            CHAT_EXPIRY,
-            link_id
-        )
+        user_sessions[user_id] = link_id
         
         return session
     
     @staticmethod
     def get_chat_session(link_id: str) -> Optional[Dict]:
         """Get chat session data"""
-        session_data = redis_client.get(f"{CHAT_SESSION_PREFIX}{link_id}")
-        if session_data:
-            return json.loads(session_data)
-        return None
+        return chat_sessions.get(link_id)
     
     @staticmethod
     def get_user_chat(user_id: int) -> Optional[str]:
         """Get active chat link for a user"""
-        link_id = redis_client.get(f"{USER_SESSION_PREFIX}{user_id}")
-        if link_id:
-            return link_id.decode('utf-8')
-        return None
+        return user_sessions.get(user_id)
     
     @staticmethod
     def end_chat(link_id: str, user_id: int = None):
         """End a chat session"""
-        session_key = f"{CHAT_SESSION_PREFIX}{link_id}"
-        session_data = redis_client.get(session_key)
+        session = chat_sessions.get(link_id)
         
-        if session_data:
-            session = json.loads(session_data)
+        if session:
             session['active'] = False
-            redis_client.setex(session_key, 300, json.dumps(session))  # Keep for 5 mins
             
             # Remove user sessions
-            if session['user1']:
-                redis_client.delete(f"{USER_SESSION_PREFIX}{session['user1']}")
-            if session['user2']:
-                redis_client.delete(f"{USER_SESSION_PREFIX}{session['user2']}")
+            if session['user1'] and session['user1'] in user_sessions:
+                del user_sessions[session['user1']]
+            if session['user2'] and session['user2'] in user_sessions:
+                del user_sessions[session['user2']]
             
             # Remove link
-            redis_client.delete(f"{CHAT_LINK_PREFIX}{link_id}")
+            if link_id in chat_links:
+                del chat_links[link_id]
             
-            # Clean up any pending messages
-            pattern = f"{MESSAGE_PREFIX}{link_id}:*"
-            for key in redis_client.scan_iter(match=pattern):
-                redis_client.delete(key)
+            # Remove session after some time
+            if link_id in chat_sessions:
+                del chat_sessions[link_id]
+            
+            # Clean up messages
+            messages_to_delete = [k for k in messages.keys() if k.startswith(f"{link_id}:")]
+            for key in messages_to_delete:
+                del messages[key]
     
     @staticmethod
     def store_message(link_id: str, message_id: int, sender_id: int, receiver_id: int):
         """Store message metadata for auto-deletion"""
-        message_key = f"{MESSAGE_PREFIX}{link_id}:{message_id}"
+        message_key = f"{link_id}:{message_id}"
         message_data = {
             'message_id': message_id,
             'sender_id': sender_id,
@@ -157,34 +124,18 @@ class ChatManager:
             'sent_at': datetime.now().isoformat(),
             'delivered': False
         }
-        redis_client.setex(message_key, MESSAGE_EXPIRY + 10, json.dumps(message_data))
+        messages[message_key] = message_data
         return message_key
-    
-    @staticmethod
-    def mark_message_delivered(link_id: str, message_id: int):
-        """Mark message as delivered (seen by receiver)"""
-        message_key = f"{MESSAGE_PREFIX}{link_id}:{message_id}"
-        message_data = redis_client.get(message_key)
-        if message_data:
-            data = json.loads(message_data)
-            data['delivered'] = True
-            data['delivered_at'] = datetime.now().isoformat()
-            redis_client.setex(message_key, MESSAGE_EXPIRY + 5, json.dumps(data))
-            return True
-        return False
     
     @staticmethod
     def get_message(link_id: str, message_id: int) -> Optional[Dict]:
         """Get message data"""
-        message_key = f"{MESSAGE_PREFIX}{link_id}:{message_id}"
-        message_data = redis_client.get(message_key)
-        if message_data:
-            return json.loads(message_data)
-        return None
+        message_key = f"{link_id}:{message_id}"
+        return messages.get(message_key)
 
 # Bot command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command"""
+    """Handle /start command - create a new chat link or join existing"""
     user_id = update.effective_user.id
     
     # Check if this is a deep link (joining a chat)
@@ -192,27 +143,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await join_chat(update, context)
         return
     
-    welcome_text = """
-👋 Welcome to Anonymous Chat Bot!
-
-🔒 Your identity is completely hidden
-👤 No one can see your name or username
-💬 Chat anonymously with others
-🗑️ Messages auto-delete 1 minute after being seen
-
-Commands:
-/chat - Start a new anonymous chat
-/end - End current chat
-/help - Show this help message
-
-To start chatting, use /chat and share the generated link with someone!
-    """
-    await update.message.reply_text(welcome_text)
-
-async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /chat command - create a new chat link"""
-    user_id = update.effective_user.id
-    
+    # If no args, create a new chat session
     # Check if user is already in a chat
     existing_chat = ChatManager.get_user_chat(user_id)
     if existing_chat:
@@ -222,35 +153,38 @@ async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "⚠️ You're already in a chat! Use /end to end the current chat first."
             )
             return
-        else:
-            # Clean up stale session
-            ChatManager.end_chat(existing_chat)
     
-    # Create new chat session
-    link_id = ChatManager.create_chat_session(user_id)
-    
-    # Generate bot link
-    bot_username = context.bot.username
-    chat_link = f"https://t.me/{bot_username}?start={link_id}"
-    
-    # Create inline keyboard
-    keyboard = [
-        [InlineKeyboardButton("📋 Copy Link", callback_data=f"copy_{link_id}")],
-        [InlineKeyboardButton("🔗 Share Link", switch_inline_query=chat_link)]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        f"🔐 Your anonymous chat link is ready!\n\n"
-        f"Share this link with ONE person to start chatting:\n"
-        f"`{chat_link}`\n\n"
-        f"⚠️ Link expires in 1 hour\n"
-        f"⚠️ Only the first person who clicks will join\n"
-        f"⚠️ You can't join your own chat\n"
-        f"🗑️ Messages auto-delete 1 minute after being seen",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
+    try:
+        # Create new chat session
+        link_id = ChatManager.create_chat_session(user_id)
+        
+        # Generate bot link
+        bot_username = context.bot.username
+        chat_link = f"https://t.me/{bot_username}?start={link_id}"
+        
+        # Create inline keyboard
+        keyboard = [
+            [InlineKeyboardButton("📋 Copy Link", callback_data=f"copy_{link_id}")],
+            [InlineKeyboardButton("🔗 Share Link", switch_inline_query=chat_link)]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            f"🔐 Your anonymous chat link is ready!\n\n"
+            f"Share this link with ONE person to start chatting:\n"
+            f"`{chat_link}`\n\n"
+            f"⚠️ Link expires when bot restarts\n"
+            f"⚠️ Only the first person who clicks will join\n"
+            f"⚠️ You can't join your own chat\n"
+            f"🗑️ Messages auto-delete 1 minute after being seen",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Error creating chat session: {e}")
+        await update.message.reply_text(
+            "❌ Failed to create chat session. Please try again later."
+        )
 
 async def join_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle joining a chat via link"""
@@ -258,7 +192,12 @@ async def join_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     # Get link ID from the start parameter
     if not context.args:
-        await update.message.reply_text("❌ Invalid chat link!")
+        await update.message.reply_text(
+            "👋 Welcome to Anonymous Chat Bot!\n\n"
+            "Use /start to create a new chat link and share it with someone.\n"
+            "Use /end to end your current chat.\n"
+            "Use /help for more information."
+        )
         return
     
     link_id = context.args[0]
@@ -273,41 +212,47 @@ async def join_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
     
-    # Join the chat
-    session = ChatManager.join_chat(link_id, user_id)
-    
-    if not session:
-        await update.message.reply_text(
-            "❌ This chat link is invalid or already in use!\n\n"
-            "Possible reasons:\n"
-            "• Link has expired (1 hour limit)\n"
-            "• Someone already joined this chat\n"
-            "• You're trying to join your own chat"
-        )
-        return
-    
-    # Notify both users
-    user1_id = session['user1']
-    user2_id = session['user2']
-    
     try:
-        await context.bot.send_message(
-            user1_id,
-            "✅ Someone has joined your chat! Start messaging anonymously.\n\n"
+        # Join the chat
+        session = ChatManager.join_chat(link_id, user_id)
+        
+        if not session:
+            await update.message.reply_text(
+                "❌ This chat link is invalid or already in use!\n\n"
+                "Possible reasons:\n"
+                "• Someone already joined this chat\n"
+                "• You're trying to join your own chat\n"
+                "• The link has expired (bot restarted)"
+            )
+            return
+        
+        # Notify both users
+        user1_id = session['user1']
+        user2_id = session['user2']
+        
+        try:
+            await context.bot.send_message(
+                user1_id,
+                "✅ Someone has joined your chat! Start messaging anonymously.\n\n"
+                "💬 Send messages to chat anonymously\n"
+                "🗑️ Messages auto-delete 1 minute after being seen\n"
+                "🚫 Use /end to end the chat"
+            )
+        except Exception as e:
+            logger.error(f"Error notifying user1: {e}")
+        
+        await update.message.reply_text(
+            "✅ You've joined the anonymous chat!\n\n"
             "💬 Send messages to chat anonymously\n"
+            "📤 Your identity is completely hidden\n"
             "🗑️ Messages auto-delete 1 minute after being seen\n"
             "🚫 Use /end to end the chat"
         )
     except Exception as e:
-        logger.error(f"Error notifying user1: {e}")
-    
-    await update.message.reply_text(
-        "✅ You've joined the anonymous chat!\n\n"
-        "💬 Send messages to chat anonymously\n"
-        "📤 Your identity is completely hidden\n"
-        "🗑️ Messages auto-delete 1 minute after being seen\n"
-        "🚫 Use /end to end the chat"
-    )
+        logger.error(f"Error joining chat: {e}")
+        await update.message.reply_text(
+            "❌ Failed to join chat. Please try again later."
+        )
 
 async def end_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /end command - end current chat"""
@@ -368,7 +313,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not link_id:
         await update.message.reply_text(
             "❌ You're not in an active chat!\n"
-            "Use /chat to start a new anonymous chat."
+            "Use /start to create a new anonymous chat link."
         )
         return
     
@@ -388,7 +333,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("❌ No other user in the chat!")
         return
     
-    # Store message in Redis for tracking
+    # Store message for tracking
     ChatManager.store_message(link_id, message_id, user_id, other_user_id)
     
     # Send message to other user
@@ -427,7 +372,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"✅ Message sent anonymously (will auto-delete in {MESSAGE_EXPIRY}s)"
         )
         
-        # Delete confirmation message after 5 seconds (not 1 minute)
+        # Delete confirmation message after 5 seconds
         asyncio.create_task(
             delete_message_after_delay(
                 context, 
@@ -472,12 +417,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 🤖 Anonymous Chat Bot Help
 
 Commands:
-/chat - Create a new anonymous chat link
+/start - Create a new anonymous chat link
 /end - End your current chat
 /help - Show this help message
 
 How it works:
-1. Use /chat to generate a unique link
+1. Use /start to generate a unique link
 2. Share the link with someone (only ONE person)
 3. When they join, you can chat anonymously
 4. Your name and username are never shown
@@ -497,7 +442,7 @@ Auto-Delete Details:
 • No message history is stored
 
 ⚠️ Important Notes:
-• Link expires in 1 hour
+• Links don't persist after bot restart
 • Only the first person who clicks can join
 • You can't join your own chat
 • Both users must stay in the chat
@@ -532,7 +477,6 @@ async def async_main() -> None:
 
     # Add command handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("chat", chat_command))
     application.add_handler(CommandHandler("end", end_chat))
     application.add_handler(CommandHandler("help", help_command))
     
@@ -556,6 +500,7 @@ async def async_main() -> None:
     # Start the Bot
     print("🤖 Bot is starting...")
     print(f"Bot username: @{application.bot.username}")
+    print("✅ Using in-memory storage (no Redis required)")
     print(f"🗑️ Messages will auto-delete after {MESSAGE_EXPIRY} seconds")
     
     try:
