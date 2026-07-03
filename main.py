@@ -9,6 +9,37 @@ from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
+# Add this near the top of your bot.py with other imports
+from aiohttp import web
+import asyncio
+import threading
+
+# ... (your existing imports and code)
+
+async def health_check(request):
+    """Handles GET requests for health checks"""
+    return web.Response(text="I'm alive! (Bot is running)")
+
+async def start_health_server():
+    """Runs a simple web server for health checks"""
+    app = web.Application()
+    app.router.add_get('/health', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8080) # You can use any available port
+    print("🩺 Health server running on port 8080")
+    await site.start()
+    # Keep the server running
+    await asyncio.Event().wait()
+
+# In your main() function, run the health server in the background
+def main():
+    # ... (your existing bot initialization code)
+
+    # Start the health check server in the background using asyncio
+    loop = asyncio.get_event_loop()
+    asyncio.create_task(start_health_server())
+
 # Load environment variables
 load_dotenv()
 
