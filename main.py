@@ -525,8 +525,8 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Handle errors"""
     logger.error(f"Update {update} caused error {context.error}")
 
-def main() -> None:
-    """Start the bot"""
+async def async_main() -> None:
+    """Async main function to start the bot"""
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
 
@@ -548,14 +548,25 @@ def main() -> None:
     application.add_error_handler(error_handler)
 
     # Start the health check server in the background
-    loop = asyncio.get_event_loop()
-    asyncio.create_task(start_health_server())
+    health_task = asyncio.create_task(start_health_server())
 
     # Start the Bot
     print("🤖 Bot is starting...")
     print(f"Bot username: @{application.bot.username}")
     print(f"🗑️ Messages will auto-delete after {MESSAGE_EXPIRY} seconds")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    try:
+        await application.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        health_task.cancel()
+        try:
+            await health_task
+        except asyncio.CancelledError:
+            pass
+
+def main() -> None:
+    """Entry point for the bot"""
+    asyncio.run(async_main())
 
 if __name__ == '__main__':
     main()
