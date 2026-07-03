@@ -24,15 +24,15 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required")
 
-# In-memory storage (replaces Redis)
-chat_sessions: Dict[str, Dict] = {}  # Store active chat sessions
-user_sessions: Dict[int, str] = {}   # Map user_id to session_id
-chat_links: Dict[str, int] = {}      # Map link_id to user_id
-messages: Dict[str, Dict] = {}       # Store messages for auto-deletion
+# In-memory storage
+chat_sessions: Dict[str, Dict] = {}
+user_sessions: Dict[int, str] = {}
+chat_links: Dict[str, int] = {}
+messages: Dict[str, Dict] = {}
 
 # Constants
-CHAT_EXPIRY = 3600  # 1 hour (not enforced strictly without Redis)
-MESSAGE_EXPIRY = 60  # 1 minute in seconds
+CHAT_EXPIRY = 3600
+MESSAGE_EXPIRY = 60
 
 class ChatManager:
     @staticmethod
@@ -40,7 +40,6 @@ class ChatManager:
         """Create a new chat session and return the link ID"""
         link_id = f"link_{user_id}_{int(datetime.now().timestamp())}"
         
-        # Store chat session
         session_data = {
             'user1': user_id,
             'user2': None,
@@ -62,15 +61,12 @@ class ChatManager:
         if not session:
             return None
         
-        # Check if chat is still active and not full
         if not session['active'] or session['user2'] is not None:
             return None
         
-        # Check if user is trying to join their own chat
         if session['user1'] == user_id:
             return None
         
-        # Add second user
         session['user2'] = user_id
         user_sessions[user_id] = link_id
         
@@ -94,21 +90,17 @@ class ChatManager:
         if session:
             session['active'] = False
             
-            # Remove user sessions
             if session['user1'] and session['user1'] in user_sessions:
                 del user_sessions[session['user1']]
             if session['user2'] and session['user2'] in user_sessions:
                 del user_sessions[session['user2']]
             
-            # Remove link
             if link_id in chat_links:
                 del chat_links[link_id]
             
-            # Remove session after some time
             if link_id in chat_sessions:
                 del chat_sessions[link_id]
             
-            # Clean up messages
             messages_to_delete = [k for k in messages.keys() if k.startswith(f"{link_id}:")]
             for key in messages_to_delete:
                 del messages[key]
@@ -126,14 +118,7 @@ class ChatManager:
         }
         messages[message_key] = message_data
         return message_key
-    
-    @staticmethod
-    def get_message(link_id: str, message_id: int) -> Optional[Dict]:
-        """Get message data"""
-        message_key = f"{link_id}:{message_id}"
-        return messages.get(message_key)
 
-# Bot command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command - create a new chat link or join existing"""
     user_id = update.effective_user.id
@@ -143,26 +128,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await join_chat(update, context)
         return
     
-    # If no args, create a new chat session
-    # Check if user is already in a chat
+    # Create new chat session
     existing_chat = ChatManager.get_user_chat(user_id)
     if existing_chat:
         session = ChatManager.get_chat_session(existing_chat)
         if session and session['active']:
-            await update.message.reply_text(
-                "⚠️ You're already in a chat! Use /end to end the current chat first."
-            )
+            # Already in chat, just send the link again
             return
     
     try:
-        # Create new chat session
         link_id = ChatManager.create_chat_session(user_id)
-        
-        # Generate bot link
         bot_username = context.bot.username
         chat_link = f"https://t.me/{bot_username}?start={link_id}"
         
-        # Create inline keyboard
         keyboard = [
             [InlineKeyboardButton("📋 Copy Link", callback_data=f"copy_{link_id}")],
             [InlineKeyboardButton("🔗 Share Link", switch_inline_query=chat_link)]
@@ -170,131 +148,71 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            f"🔐 Your anonymous chat link is ready!\n\n"
-            f"Share this link with ONE person to start chatting:\n"
             f"`{chat_link}`\n\n"
-            f"⚠️ Link expires when bot restarts\n"
-            f"⚠️ Only the first person who clicks will join\n"
-            f"⚠️ You can't join your own chat\n"
-            f"🗑️ Messages auto-delete 1 minute after being seen",
+            f"Share with ONE person to start chatting",
             reply_markup=reply_markup,
             parse_mode='Markdown'
         )
     except Exception as e:
         logger.error(f"Error creating chat session: {e}")
-        await update.message.reply_text(
-            "❌ Failed to create chat session. Please try again later."
-        )
 
 async def join_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle joining a chat via link"""
     user_id = update.effective_user.id
     
-    # Get link ID from the start parameter
     if not context.args:
-        await update.message.reply_text(
-            "👋 Welcome to Anonymous Chat Bot!\n\n"
-            "Use /start to create a new chat link and share it with someone.\n"
-            "Use /end to end your current chat.\n"
-            "Use /help for more information."
-        )
         return
     
     link_id = context.args[0]
     
-    # Check if user is already in a chat
     existing_chat = ChatManager.get_user_chat(user_id)
     if existing_chat:
         session = ChatManager.get_chat_session(existing_chat)
         if session and session['active']:
-            await update.message.reply_text(
-                "⚠️ You're already in a chat! Use /end to end the current chat first."
-            )
             return
     
     try:
-        # Join the chat
         session = ChatManager.join_chat(link_id, user_id)
         
         if not session:
-            await update.message.reply_text(
-                "❌ This chat link is invalid or already in use!\n\n"
-                "Possible reasons:\n"
-                "• Someone already joined this chat\n"
-                "• You're trying to join your own chat\n"
-                "• The link has expired (bot restarted)"
-            )
             return
         
-        # Notify both users
         user1_id = session['user1']
-        user2_id = session['user2']
         
+        # Only notify the chat creator that someone joined
         try:
             await context.bot.send_message(
                 user1_id,
-                "✅ Someone has joined your chat! Start messaging anonymously.\n\n"
-                "💬 Send messages to chat anonymously\n"
-                "🗑️ Messages auto-delete 1 minute after being seen\n"
-                "🚫 Use /end to end the chat"
+                "_"
             )
         except Exception as e:
             logger.error(f"Error notifying user1: {e}")
         
-        await update.message.reply_text(
-            "✅ You've joined the anonymous chat!\n\n"
-            "💬 Send messages to chat anonymously\n"
-            "📤 Your identity is completely hidden\n"
-            "🗑️ Messages auto-delete 1 minute after being seen\n"
-            "🚫 Use /end to end the chat"
-        )
+        # Don't send any message to the joining user
+        # They can just start chatting
+        
     except Exception as e:
         logger.error(f"Error joining chat: {e}")
-        await update.message.reply_text(
-            "❌ Failed to join chat. Please try again later."
-        )
 
 async def end_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /end command - end current chat"""
     user_id = update.effective_user.id
-    
-    # Find user's chat
     link_id = ChatManager.get_user_chat(user_id)
     
     if not link_id:
-        await update.message.reply_text("❌ You're not in any active chat!")
         return
     
-    # Get chat session
     session = ChatManager.get_chat_session(link_id)
     
     if session and session['active']:
-        # Get other user ID
         other_user_id = session['user1'] if session['user1'] != user_id else session['user2']
-        
-        # End the chat
         ChatManager.end_chat(link_id, user_id)
-        
-        # Notify other user
-        if other_user_id:
-            try:
-                await context.bot.send_message(
-                    other_user_id,
-                    "🔚 The other user has ended the chat."
-                )
-            except Exception as e:
-                logger.error(f"Error notifying other user: {e}")
-        
-        await update.message.reply_text("🔚 Chat ended successfully!")
-    else:
-        await update.message.reply_text("❌ Chat not found or already ended!")
 
 async def delete_message_after_delay(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int = 60):
     """Delete a message after specified delay"""
     await asyncio.sleep(delay)
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-        logger.info(f"Deleted message {message_id} in chat {chat_id} after {delay} seconds")
     except Exception as e:
         logger.error(f"Failed to delete message {message_id}: {e}")
 
@@ -307,36 +225,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not message_text:
         return
     
-    # Find user's active chat
     link_id = ChatManager.get_user_chat(user_id)
     
     if not link_id:
-        await update.message.reply_text(
-            "❌ You're not in an active chat!\n"
-            "Use /start to create a new anonymous chat link."
-        )
         return
     
-    # Get chat session
     session = ChatManager.get_chat_session(link_id)
     
     if not session or not session['active']:
-        await update.message.reply_text("❌ This chat is no longer active!")
-        # Clean up
         ChatManager.end_chat(link_id)
         return
     
-    # Determine other user
     other_user_id = session['user1'] if session['user1'] != user_id else session['user2']
     
     if not other_user_id:
-        await update.message.reply_text("❌ No other user in the chat!")
         return
     
-    # Store message for tracking
     ChatManager.store_message(link_id, message_id, user_id, other_user_id)
     
-    # Send message to other user
     try:
         # Send the message to the other user
         sent_message = await context.bot.send_message(
@@ -344,10 +250,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"💬 {message_text}"
         )
         
-        # Store the forwarded message ID for deletion
         ChatManager.store_message(link_id, sent_message.message_id, user_id, other_user_id)
         
-        # Schedule deletion of the sender's original message
+        # Schedule deletion of both messages
         asyncio.create_task(
             delete_message_after_delay(
                 context, 
@@ -357,7 +262,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
         )
         
-        # Schedule deletion of the sent message (to other user)
         asyncio.create_task(
             delete_message_after_delay(
                 context, 
@@ -367,33 +271,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
         )
         
-        # Send confirmation to sender (this will also be deleted)
-        confirm_msg = await update.message.reply_text(
-            f"✅ Message sent anonymously (will auto-delete in {MESSAGE_EXPIRY}s)"
-        )
-        
-        # Delete confirmation message after 5 seconds
-        asyncio.create_task(
-            delete_message_after_delay(
-                context, 
-                update.effective_chat.id, 
-                confirm_msg.message_id, 
-                5
-            )
-        )
-        
     except Exception as e:
         logger.error(f"Error sending message: {e}")
-        error_msg = await update.message.reply_text("❌ Failed to send message. The other user might have left.")
-        # Delete error message after 5 seconds
-        asyncio.create_task(
-            delete_message_after_delay(
-                context, 
-                update.effective_chat.id, 
-                error_msg.message_id, 
-                5
-            )
-        )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle button callbacks"""
@@ -404,55 +283,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         link_id = query.data.replace("copy_", "")
         chat_link = f"https://t.me/{context.bot.username}?start={link_id}"
         await query.message.reply_text(
-            f"📋 Share this link with someone:\n\n"
-            f"`{chat_link}`\n\n"
-            f"⚠️ Only the first person who clicks will join\n"
-            f"🗑️ Messages auto-delete 1 minute after being seen",
+            f"`{chat_link}`",
             parse_mode='Markdown'
         )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /help command"""
-    help_text = """
-🤖 Anonymous Chat Bot Help
+    # Don't send any help message
+    pass
 
-Commands:
-/start - Create a new anonymous chat link
-/end - End your current chat
-/help - Show this help message
-
-How it works:
-1. Use /start to generate a unique link
-2. Share the link with someone (only ONE person)
-3. When they join, you can chat anonymously
-4. Your name and username are never shown
-5. Messages auto-delete 1 minute after being seen
-
-Privacy Features:
-🔒 Complete anonymity
-👤 No personal information shared
-🗑️ No chat history stored
-⏰ Messages auto-delete after 60 seconds
-🔐 End-to-end private chatting
-
-Auto-Delete Details:
-• Messages are deleted 60 seconds after being sent
-• Both sender and receiver see messages disappear
-• Confirmation messages delete after 5 seconds
-• No message history is stored
-
-⚠️ Important Notes:
-• Links don't persist after bot restart
-• Only the first person who clicks can join
-• You can't join your own chat
-• Both users must stay in the chat
-    """
-    await update.message.reply_text(help_text)
-
-# Health check endpoint for UptimeRobot
+# Health check endpoint
 async def health_check(request):
     """Handles GET requests for health checks"""
-    return web.Response(text="I'm alive! (Bot is running)", status=200)
+    return web.Response(text="OK", status=200)
 
 async def start_health_server():
     """Runs a simple web server for health checks"""
@@ -463,7 +306,6 @@ async def start_health_server():
     site = web.TCPSite(runner, '0.0.0.0', 8080)
     print("🩺 Health server running on port 8080")
     await site.start()
-    # Keep the server running
     await asyncio.Event().wait()
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -472,41 +314,27 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def async_main() -> None:
     """Async main function to start the bot"""
-    # Create application
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Add command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("end", end_chat))
     application.add_handler(CommandHandler("help", help_command))
-    
-    # Add callback handler for buttons
     application.add_handler(CallbackQueryHandler(button_callback))
-    
-    # Add message handler for chat messages
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
-    
-    # Add error handler
     application.add_error_handler(error_handler)
 
-    # Initialize the application first
     await application.initialize()
     
-    # Start the health check server in the background
     health_task = asyncio.create_task(start_health_server())
 
-    # Start the Bot
     print("🤖 Bot is starting...")
     print(f"Bot username: @{application.bot.username}")
-    print("✅ Using in-memory storage (no Redis required)")
-    print(f"🗑️ Messages will auto-delete after {MESSAGE_EXPIRY} seconds")
     
     try:
         await application.start()
         await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        # Keep the bot running
         await asyncio.Event().wait()
     finally:
         health_task.cancel()
